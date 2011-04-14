@@ -1,11 +1,15 @@
 Get-Module -Name pstrami | Remove-Module
-Import-Module .\src\pstrami\pstrami.psm1
 
+$fullPathIncFileName = $MyInvocation.MyCommand.Definition
+$currentScriptName = $MyInvocation.MyCommand.Name
+$currentExecutingPath = $fullPathIncFileName.Replace("\$currentScriptName", "")
+
+Import-Module (resolve-path "$currentExecutingPath\..\pstrami\pstrami.psm1")
 Function Test.Can_load_config_file()
 {
     #Arrange
     #Act
-    Load-Configuration  ".\src\pstrami\pstrami.config.ps1"
+    Load-Configuration  "$currentExecutingPath\..\pstrami\pstrami.config.ps1"
 	$Actual = Get-Environments
     
     #Assert
@@ -17,5 +21,3 @@ Function Test.Can_load_config_file()
 }
 
 Test.Can_load_config_file
-
-
