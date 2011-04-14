@@ -5,18 +5,17 @@ $currentScriptName = $MyInvocation.MyCommand.Name
 $currentExecutingPath = $fullPathIncFileName.Replace("\$currentScriptName", "")
 
 Import-Module (resolve-path "$currentExecutingPath\..\pstrami\pstrami.psm1")
-Function Test.Can_load_config_file()
-{
+Function Test.Can_load_config_file() {
     #Arrange
     #Act
     Load-Configuration  "$currentExecutingPath\..\pstrami\pstrami.config.ps1"
 	$Actual = Get-Environments
     
+    #NOTE: This only works if there are environments defined
+    
     #Assert
-
-    if( -not ($Actual.length -gt 0))
-	{
-		throw "enviornment did not load"
+    if($Actual -eq $null) {
+		throw ("environment did not load")
 	}	
 }
 
