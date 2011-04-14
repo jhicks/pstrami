@@ -1,3 +1,5 @@
+#--- deployment functions
+
 function Deploy-Package{
     param(
         [string]$EnvironmentName,
@@ -5,98 +7,49 @@ function Deploy-Package{
         [boolean]$Install=$false)
         
     Load-Configuration
-    
-    $environment =  Get-Environments  | where-object {$_.Name -eq $EnvironmentName} 
 
-    Assert ( $environment -ne $null ) "$EnvironmentName is not a valid EnvironmentName argument"
-    
-    $package = resolve-path $package
-    
-    foreach($server in $environment.Servers)  {
-        "Deploying to " + $server.Name + " Roles: " + $server.Roles        
-        $hostname = hostname
-        if(($server.Name -eq $hostname) -OR ($server.Name -eq "localhost"))
-        {
-            Install-RemoteServer $server $Package $environment
-            #Install-LocalServer $server.Name $Package $EnvironmentName
-        }
-        else
-        {
-            Install-RemoteServer $server $Package $environment
-        }
-    }    
-}
-
-function Install-LocalServer{
-    param([string] $serverName,[string] $packagePath,[string]$environmentName,[boolean]$OneTime=$false)
-    
-    set-location $packagePath
-    $roles = Get-Roles
-	dir modules\*.psm1 | Import-Module
-    Foreach($role in $roles)
-    {        
-        $global:env = $environmentName
-        "Executing Role: " + $role.Name
-		if($onetime)
-        {
-            invoke-command -scriptblock $role.FullInstall
-        }
-		
-        invoke-command -scriptblock $role.Action
-    }
-	"Deployment Succeded"
-}
-
-function Get-ServerRoles
-{
-    param([string]$serverName,[string]$environmentName)
-	
-	$roles = New-Object System.Collections.ArrayList
-	
-	$env = Get-Environments | Where-Object {$_.Name -eq $EnvironmentName} 
-    
-	foreach($server in $env.Servers)
-	{
-		if($server.name -eq $serverName) {
-			foreach($role in $server.Roles)	{
-				Get-Roles | ? {
-				if ($_.Name -eq $role){$roles.Add($_)}
-				}
-			}
-		}
+    if(test-path .\pstrami_logs) {
+		rmdir .\pstrami_logs -recurse | out-null
 	}
-    return $roles
+	
+	if(-not (test-path .\pstrami_logs)) {
+		mkdir .\pstrami_logs | out-null
+	}
+	
+    $package = resolve-path $package
+    get-environments | ?{$_.Name -eq $EnvironmentName} | %{deploy-environment $_ $package $Install}
+}
+
+function deploy-environment($environment, [string]$package, [boolean]$Install=$false) {
+    $index = 0
+    $environment.Servers | %{
+        install-remoteserver $index $_ $package $environment $Install
+        $index++
+    }
 }
 
 function Install-RemoteServer{
     param(
+        [int] $index,
         [object]  $server,
         [string]  $packagePath,
         [object]  $environment,
-        [boolean] $OneTime=$false,
+        [boolean] $OneTime=0,
         [string] $successMessage = "Deployment Succeded")
-    "Install-RemoteServer"
-    
-    copy-item "pstrami.psm1"  $packagePath
+    write-host "Install-RemoteServer"
     
     Send-Files $packagePath $server.Name $environment.InstallPath $server.Credential
 
-    Create-RemoteBootstrapper $server.Name $environment.InstallPath $environmentName | out-file bootstrap.bat -encoding ASCII
-
-	Get-Content bootstrap.bat | Out-Default
-	
-    $result = Invoke-RemoteCommand $server.Name bootstrap.bat $server.Credential
+    Create-RemoteBootstrapper $index $server.Name $environment.InstallPath $environmentName $OneTime | out-file .\pstrami_logs\bootstrap.bat -encoding ASCII
     
-    remove-item bootstrap.bat
+    $result = Invoke-RemoteCommand $server.Name (resolve-path .\pstrami_logs\bootstrap.bat) $server.Credential
 
-    $result|% { foreach($line in $_.Split("`r")) { if($line){ $line|Out-Default}}}
-    
-    if(-not (select-string -inputobject $result -pattern $successMessage))
+    if(-not (select-string -InputObject $result -pattern $successMessage))
     {    
-        "Install-RemoteServer Failed"
+        write-host ("Install-RemoteServer Failed.  Check the logs @ " + (resolve-path .\pstrami_logs\bootstrap.bat)) -ForegroundColor Red
         exit '-1'
     }    
-    "Install-RemoteServer Succeeded"
+    write-host "Install-RemoteServer Succeeded"
 }
 
 function Invoke-RemoteCommand{
@@ -106,13 +59,12 @@ function Invoke-RemoteCommand{
     
     if($cred -ne "")
     {
-        $cred = ",getCredentials=" + $cred
+        $cred = "," + $cred
     }
     $msdeployexe= "C:\Program` Files\IIS\Microsoft` Web` Deploy\msdeploy.exe"    
-    .$msdeployexe "-verb:sync" "-dest:auto,computername=$server$cred" "-source:runCommand=$cmd,waitInterval=2500,waitAttempts=20" | out-file "send-package.log"
+    $result = &"$msdeployexe" "-verb:sync" "-dest:auto,computername=$server$cred" "-source:runCommand=$cmd,waitInterval=2500,waitAttempts=1000"
     
-    $result = get-content send-package.log 
-    remove-item send-package.log   
+    $result | out-file .\pstrami_logs\invoke-remotecommand.log -Append
     return $result    
 }
 
@@ -121,167 +73,101 @@ function Send-Files{
             [string] $server,
             [string] $remotePackagePath,
             [string] $cred)
-    "Sending Files to $server : $remotePackagePath"        
+    write-host "Sending Files to $server : $remotePackagePath"        
     $msdeployexe= "C:\Program` Files\IIS\Microsoft` Web` Deploy\msdeploy.exe"    
    
     if($cred -ne "")
     {
-        $cred = ",getCredentials=" + $cred
+        $cred = "," + $cred
     }
 
-   if(-not( test-path $packagePath+"pstrami.psm1"  ))
-    {
-        copy-item *.* $packagePath
-		mkdir $packagePath\modules|Out-Null
-		copy-item modules\*.* $packagePath\modules
-    }
-
-    remove-item sync-package.log   -ErrorAction SilentlyContinue | out-null    
-    .$msdeployexe "-verb:sync" "-source:dirPath=$packagePath" "-dest:dirPath=$remotePackagePath,computername=$server$cred"  "-skip:objectName=filePath,absolutePath=.*\.log" | out-file sync-package.log     
-    get-content sync-package.log | Out-Default
+    &"$msdeployexe" "-verb:sync" "-source:dirPath=$packagePath" "-dest:dirPath=$remotePackagePath,computername=$server$cred" "-skip:objectName=dirPath,absolutePath=pstrami_logs" | out-file .\pstrami_logs\sync-package.log
+    Get-Content .\pstrami_logs\sync-package.log | Select-Object -last 1 | out-default
 }
-
 
 function Create-RemoteBootstrapper{
-    param(  [string]$server,
+    param(  [int] $index,
+            [string]$serverName,
             [string] $remotePackagePath,
-            [string] $EnvironmentName)
-            
-    return "@echo off
-    cd /D $remotePackagePath    
-    powershell.exe -NoProfile -ExecutionPolicy unrestricted -Command `"& { import-module .\pstrami.psm1; Load-Configuration;Install-LocalServer $server $remotePackagePath $EnvironmentName;if ($lastexitcode -ne 0) { write-host `"ERROR: $lastexitcode`" -fore RED }; stop-process `$pid }"
-}
-
-<#
-.SYNOPSIS
-Send-Package will send pstrami and all the files in the current directory to the destination directory on a server.
-It will than execute the installation package on the remote server.
-.PARAMETER server
-This is the remote server that the pastrami package will be push to.
-#>
-function Send-Package {  
-    param(  [parameter(Mandatory=$true)] [string]$server,
-            [parameter(Mandatory=$true)] [string]$destinationDirectory,
-            [parameter(Mandatory=$true)] [string]$cmd,
-            [string] $credentials="none",
-            [string] $successMessage="BUILD SUCCEEDED"
-             );    
+            [string] $EnvironmentName,
+            [boolean] $OneTime=0)
     
-    $cred = ""
-    if($credentials -ne "none")
-    {
-        $cred = ",getCredentials=$credentials"
-    }
-        
-    $msdeployexe= "C:\Program` Files\IIS\Microsoft` Web` Deploy\msdeploy.exe"
+    $fullinstall = 0
     
-    $sourceDirPath = resolve-path .
-    remove-item sync-package.log   -ErrorAction SilentlyContinue | out-null
-    
-    .$msdeployexe "-verb:sync" "-source:dirPath=$sourceDirPath" "-dest:dirPath=$destinationDirectory,computername=$server$cred"  "-skip:objectName=filePath,absolutePath=.*\.log" | out-file sync-package.log 
-    
-    get-content sync-package.log | write-host
-    
-    "@echo off
-    cd /D $destinationDirectory    
-    powershell.exe -NoProfile -ExecutionPolicy unrestricted -Command `"& { import-module .\pstrami.psm1 ;        Receive-Package $cmd ;if ($lastexitcode -ne 0) { write-host `"ERROR: $lastexitcode`" -fore RED }; stop-process `$pid }" | out-file bootstrap.bat -encoding ASCII
-
-    .$msdeployexe "-verb:sync" "-dest:auto,computername=$server$cred" "-source:runCommand=bootstrap.bat,waitInterval=2500,waitAttempts=20" | out-file "send-package.log"
-    
-    get-content send-package.log | write-host
-    
-    if(-not (select-string -path send-package.log -pattern $successMessage))
-    {    
-        "Send-Package Failed"
-        exit '-1'
+    if($OneTime -eq $true) {
+        $fullinstall = 1
     }
     
-    "Send-Package Succeeded"
-    remove-item sync-package.log
-    remove-item send-package.log
-    remove-item bootstrap.bat
+    return '@echo off
+    cd /D ' + $remotePackagePath + '
+    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy unrestricted -Command "& { try { import-module .\pstrami.psm1; Load-Configuration;Install-LocalServer ' + $index + ' ' + $serverName + ' ' + $remotePackagePath + ' ' + $EnvironmentName + ' ' + $fullinstall + '; } catch { write-host "ERROR: $Error" }; stop-process $pid; }'
 }
 
-function Receive-Package {
+#--- local install functions
 
-    param( 
-    [parameter(Mandatory=$true)]
-    [string]
-    $applicationName, 
-    [parameter(Mandatory=$true)]
-    [string]
-    $databaseServer,
-    [parameter(Mandatory=$true)]
-    [string]
-    $instance,
-    [parameter(Mandatory=$true)]
-    [string]
-    $reloadData) 
-
+function Install-LocalServer {
+    param([int] $index, [string]$serverName, [string] $packagePath,[string]$environmentName,[boolean]$OneTime=$false)
     
-    $appinstance = "$($applicationName)_$($instance)" #the variable parsing needs to be surrounded with parens.
-    
-    $codedir="..\codeToDeploy_$appinstance\"
-
-    if(test-path $codedir){ remove-item $codedir -Recurse }
-
-    & ".\$($applicationName)Package.exe" "-o$codedir" -y
-    
-    set-location $codedir
-
-    & ".\CommonDeploy.bat" "$databaseServer" "$appinstance" "$reloadData"        
-}
-
-
-function Assert { [CmdletBinding(
-    SupportsShouldProcess=$False,
-    SupportsTransactions=$False, 
-    ConfirmImpact="None",
-    DefaultParameterSetName="")]
+    set-location $packagePath
 	
-	param(
-	  [Parameter(Position=0,Mandatory=1)]$conditionToCheck,
-	  [Parameter(Position=1,Mandatory=1)]$failureMessage
-	)
-	if (!$conditionToCheck) { throw $failureMessage }
-}
-		
-function Load-Configuration{        
-	param([string]$configFile=".\pstrami.config.ps1")
-    	"Loading Config from $configFile"
-			if ($script:context -eq $null)
-			{
-				$script:context = New-Object System.Collections.Stack
-			}
-			
-			$script:context.push(@{
-			"roles" = @{}; #contains the deployment steps for each role        
-            "environments" = @{};            
-			
-			})
-            . $configFile
-   
-            
-<#
-	$script:context.Peek().roles |  format-list
-            foreach($key in $script:context.Peek().environments.Keys) 
-        	{
-        		$task = $script:context.Peek().environments.$key
-        		$task
-                foreach($server in $task.Servers)
-                {
-                    "Server: $($server.Name)"
-                    foreach($role in $server.roles)
-                    {                    
-                        "Role: $role"
-                    }
-                }
-        	}
-  #>  
+	dir modules\*.psm1 | Import-Module
+
+    $global:env = $environmentName
+    write-host "Deploying server $serverName ($index) for environment named $global:env"
+
+    $environment = Get-Environments | ?{$_.Name -eq $environmentName}
+    if($environment -eq $null) {
+        write-host ("ERROR: Could not find environment " + $environmentName)
+        return;
+    }
+    
+    $server = $environment.Servers[$index]
+    if($server -eq $null) { 
+        write-host ("ERROR: No server defined @ index " + $index + " in environment " + $environmentName)
+        return;
+    }
+
+    $global:server = $server
+    $definedRoles = $script:context.Peek().roles
+    
+    $server.Roles | %{
+        Assert ($definedRoles.ContainsKey($_.ToLower()) -eq $true) ("No role named " + $_ + " (" + $_.ToLower() + ") defined")
+        $role = $definedRoles[$_.ToLower()]
+        Assert ($role -ne $null) ("Could not load role " + $_ + " (" + $_.ToLower() + ")")
+        
+        execute-role $role $OneTime
+    }
+
+	write-host "Deployment Succeded"
 }
 
-function Get-Environments{
-    return $script:context.Peek().environments.Values
+function Execute-Role($role, [boolean]$fullinstall) {
+    write-host ("Executing Role: {0}" -f $role.Name)
+    
+    
+    if($fullinstall -eq $true) {
+        invoke-command -scriptblock $role.FullInstall -ErrorAction Stop
+    }
+
+    invoke-command -scriptblock $role.Action -ErrorAction Stop
+}
+
+#--- configuration functions
+
+function Load-Configuration {
+	param([string]$configFile=".\pstrami.config.ps1")
+	write-host "Loading Config from $configFile"
+
+    if ($script:context -eq $null)
+	{
+		$script:context = New-Object System.Collections.Stack
+	}
+		
+	$script:context.push(@{
+        "roles" = @{}; #contains the deployment steps for each role        
+        "environments" = @{};            
+	})
+    . $configFile
 }
 
 function Role {
@@ -301,13 +187,9 @@ function Role {
 	
 	$taskKey = $name.ToLower()
 	
-	Assert (!$script:context.Peek().roles.ContainsKey($taskKey)) "Error: Role, $name, has already been defined."
+	Assert (-not $script:context.Peek().roles.ContainsKey($taskKey)) "Error: Role, $name, has already been defined."
 	
 	$script:context.Peek().roles.$taskKey = $newTask
-}
-
-function Get-Roles {
-    return $script:context.Peek().roles.Values
 }
 
 function Server {
@@ -343,11 +225,32 @@ function Environment {
 	
 	$taskKey = $name.ToLower()
 	
-	Assert (!$script:context.Peek().environments.ContainsKey($taskKey)) "Error: Role, $name, has already been defined."
+	Assert (-not $script:context.Peek().environments.ContainsKey($taskKey)) "Error: Environment, $name, has already been defined."
 	
 	$script:context.Peek().environments.$taskKey = $newTask
-	#return $newTask
 }
 
+#--- general functions
 
-Export-ModuleMember Receive-Package, Send-Package, Load-Configuration, Deploy-Package,Install-LocalServer,get-serverroles,get-roles,Get-Environments
+function Assert { [CmdletBinding(
+    SupportsShouldProcess=$False,
+    SupportsTransactions=$False, 
+    ConfirmImpact="None",
+    DefaultParameterSetName="")]
+	
+	param(
+	  [Parameter(Position=0,Mandatory=1)]$conditionToCheck,
+	  [Parameter(Position=1,Mandatory=1)]$failureMessage
+	)
+	if (!$conditionToCheck) { throw $failureMessage }
+}
+
+function Get-Environments{
+    return $script:context.Peek().environments.Values
+}
+
+function Get-Roles {
+    return $script:context.Peek().roles.Values
+}
+
+Export-ModuleMember Load-Configuration, Deploy-Package, Install-LocalServer, Get-Environments, Get-Roles
